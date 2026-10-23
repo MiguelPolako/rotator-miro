@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Rotator</title>
+  <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 20px;
+      background: #fff;
+      color: #1a1a2e;
+    }
+    h1 { font-size: 18px; margin-bottom: 16px; }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 12px 16px;
+      margin-bottom: 10px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:active { opacity: 0.7; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-spin { background: #4262ff; color: #fff; font-size: 16px; padding: 14px 16px; }
+    .btn-undo { background: #f0f0f0; color: #555; font-size: 12px; margin-top: 8px; }
+    hr { border: none; border-top: 1px solid #e8e8e8; margin: 14px 0; }
+    .hint { font-size: 11px; color: #999; margin-top: 4px; line-height: 1.4; }
+    #status {
+      margin-top: 14px;
+      padding: 10px 12px;
+      background: #f4f4f6;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #444;
+      min-height: 48px;
+      white-space: pre-wrap;
+    }
+    #preview {
+      background: #f0f4ff;
+      border: 1px solid #c7d7ff;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      font-size: 13px;
+      color: #333;
+    }
+    #preview .count {
+      font-size: 26px;
+      font-weight: 700;
+      color: #4262ff;
+      line-height: 1.2;
+    }
+    #preview .label { font-size: 11px; color: #888; margin-bottom: 6px; }
+    #preview .dim { font-size: 11px; color: #aaa; margin-top: 4px; }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .slider-row label { font-size: 11px; color: #888; white-space: nowrap; width: 110px; }
+    .slider-row input[type=range] { flex: 1; accent-color: #4262ff; }
+    .slider-row .slider-val { font-size: 12px; font-weight: 600; color: #4262ff; width: 44px; text-align: right; }
+  </style>
+</head>
+<body>
+  <h1>🎲 Rotator</h1>
+
+  <div id="preview">
+    <div class="label">Zaznaczone karteczki do zamiany:</div>
+    <div class="count" id="preview-count">—</div>
+    <div class="dim" id="preview-dim">Zaznacz co najmniej 2 karteczki na planszy</div>
+
+    <div class="slider-row">
+      <label>Liczba przetasowań</label>
+      <input type="range" id="rounds-slider" min="1" max="8" value="3" step="1">
+      <span class="slider-val" id="rounds-val">3</span>
+    </div>
+    <div class="slider-row">
+      <label>Tempo (ms)</label>
+      <input type="range" id="delay-slider" min="200" max="1500" value="600" step="50">
+      <span class="slider-val" id="delay-val">600</span>
+    </div>
+
+  </div>
+
+  <button class="btn btn-spin" id="btn-spin">🎲 Losuj!</button>
+  <p class="hint">Zaznacz karteczki (np. z numerami grup), potem kliknij. Karteczki zamienią się miejscami kilka razy, zwalniając, aż zatrzymają się na wyniku końcowym.</p>
+
+  <hr/>
+
+  <button class="btn btn-undo" id="btn-undo" disabled>↩️ Przywróć układ sprzed losowania</button>
+
+  <div id="status">Zaznacz karteczki i kliknij "Losuj!".</div>
+
+  <script>
+    // ── Konfiguracja ──────────────────────────────────────────────
+    // Typy obiektów, które mogą zamieniać się miejscami
+    const ALLOWED_TYPES = ['sticky_note', 'card', 'shape', 'text', 'image', 'app_card'];
+    const MAX_ITEMS     = 200;   // bezpiecznik dla limitów Miro Web SDK
+
+    let ROUNDS    = 3;    // ile razy karteczki przetasują się przed wynikiem
+    let BASE_DELAY = 600; // pauza po pierwszym przetasowaniu (kolejne są coraz dłuższe)
+
+    // ── Elementy UI ───────────────────────────────────────────────
+    const statusEl     = document.getElementById('status');
+    const btnSpin      = document.getElementById('btn-spin');
+    const btnUndo      = document.getElementById('btn-undo');
+    const roundsSlider = document.getElementById('rounds-slider');
+    const roundsVal    = document.getElementById('rounds-val');
+    const delaySlider  = document.getElementById('delay-slider');
+    const delayVal     = document.getElementById('delay-val');
+
+    let running  = false;
+    let lastRun  = null;   // { items, positions } — układ sprzed ostatniego losowania
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Tylko obiekty, które da się przesuwać (bez ramek, konektorów itp.)
+    function eligible(items) {
+      return items.filter((it) => ALLOWED_TYPES.includes(it.type));
+    }
+
+    // Losowa permutacja indeksów 0..n-1 (Fisher–Yates)
+    function shuffle(n) {
+      const p = [...Array(n).keys()];
+      for (let i = n - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [p[i], p[j]] = [p[j], p[i]];
+      }
+      return p;
+    }
+
+    // Ustawia items[i] na pozycji positions[perm[i]] i synchronizuje wszystkie naraz
+    async function applyPermutation(items, positions, perm) {
+      items.forEach((it, i) => {
+        it.x = positions[perm[i]].x;
+        it.y = positions[perm[i]].y;
+      });
+      await Promise.all(items.map((it) => it.sync()));
+    }
+
+    // ── Losowanie ─────────────────────────────────────────────────
+    btnSpin.addEventListener('click', async () => {
+      if (running) return;
+
+      const items = eligible(await miro.board.getSelection());
+      if (items.length < 2) {
+        setStatus('⚠️ Zaznacz co najmniej 2 karteczki.');
+        return;
+      }
+      if (items.length > MAX_ITEMS) {
+        setStatus(`⚠️ Za dużo obiektów (${items.length}). Maksimum to ${MAX_ITEMS}.`);
+        return;
+      }
+
+      // Pozycje x/y obiektów w ramce są liczone względem ramki, a nie planszy.
+      // Zamiana między różnymi ramkami przestawiłaby je w złe miejsca.
+      const parents = new Set(items.map((it) => it.parentId || null));
+      if (parents.size > 1) {
+        setStatus('⚠️ Karteczki muszą być wszystkie w tej samej ramce (albo wszystkie poza ramkami).');
+        return;
+      }
+
+      running = true;
+      btnSpin.disabled = true;
+      btnUndo.disabled = true;
+
+      const positions = items.map((it) => ({ x: it.x, y: it.y }));
+      lastRun = { items, positions };
+
+      try {
+        // Przetasowania "dla efektu" — z każdą rundą coraz wolniej, jak zwalniające koło
+        for (let r = 1; r < ROUNDS; r++) {
+          setStatus(`🎲 Tasowanie… ${r}/${ROUNDS}`);
+          await applyPermutation(items, positions, shuffle(items.length));
+          await sleep(BASE_DELAY * (1 + (r - 1) * 0.5));
+        }
+
+        // Wynik końcowy
+        const finalPerm = shuffle(items.length);
+        await applyPermutation(items, positions, finalPerm);
+
+        setStatus(`✅ Gotowe! Wylosowano nowy układ ${items.length} karteczek.\n\nNie podoba się? Kliknij "Losuj!" jeszcze raz albo przywróć poprzedni układ.`);
+      } catch (e) {
+        setStatus(`❌ Błąd: ${e.message}\n\nCzy ktoś nie usunął karteczki w trakcie losowania?`);
+      } finally {
+        running = false;
+        btnSpin.disabled = false;
+        btnUndo.disabled = !lastRun;
+      }
+    });
+
+    // ── Cofnięcie ostatniego losowania ────────────────────────────
+    btnUndo.addEventListener('click', async () => {
+      if (running || !lastRun) return;
+      const { items, positions } = lastRun;
+      try {
+        await applyPermutation(items, positions, [...items.keys()]);
+        setStatus('↩️ Przywrócono układ sprzed losowania.');
+        lastRun = null;
+        btnUndo.disabled = true;
+      } catch (e) {
+        setStatus(`❌ Nie udało się przywrócić: ${e.message}`);
+      }
+    });
+
+    // ── Podgląd zaznaczenia ───────────────────────────────────────
+    const countEl = document.getElementById('preview-count');
+    const dimEl   = document.getElementById('preview-dim');
+
+    function updatePreview(selection) {
+      const items   = eligible(selection || []);
+      const skipped = (selection || []).length - items.length;
+      if (items.length === 0) {
+        countEl.textContent = '—';
+        dimEl.textContent   = 'Zaznacz co najmniej 2 karteczki na planszy';
+        return;
+      }
+      countEl.textContent = items.length;
+      dimEl.textContent   = items.length < 2
+        ? 'Potrzebne są co najmniej 2 karteczki'
+        : skipped > 0 ? `Pominięto ${skipped} obiekt(y) (ramki, linie itp.)` : 'Gotowe do losowania';
+    }
+
+    roundsSlider.addEventListener('input', () => {
+      ROUNDS = parseInt(roundsSlider.value);
+      roundsVal.textContent = ROUNDS;
+    });
+
+    delaySlider.addEventListener('input', () => {
+      BASE_DELAY = parseInt(delaySlider.value);
+      delayVal.textContent = BASE_DELAY;
+    });
+
+    miro.board.ui.on('selection:update', async (event) => {
+      updatePreview(event.items);
+    });
+
+    // ── Inicjalizacja: pokaż stan przy otwarciu panelu ─────────────
+    (async () => {
+      try {
+        updatePreview(await miro.board.getSelection());
+      } catch (e) { /* ignoruj błędy inicjalizacji */ }
+    })();
+  </script>
+</body>
+</html>
